@@ -59,11 +59,11 @@ static const int MIN_SECTOR_POINTS = 3;
 static const int ROBUST_SAMPLES = 5;
 
 // -------- Distance thresholds --------
-static const float FRONT_SLOW_M = 0.70f;
-static const float FRONT_TURN_TRIGGER_M = 0.42f;
-static const float FRONT_HARD_BRAKE_M = 0.24f;
+static const float FRONT_SLOW_M = 0.84f;
+static const float FRONT_TURN_TRIGGER_M = 0.44f;
+static const float FRONT_HARD_BRAKE_M = 0.25f;
 static const float FRONT_CLEAR_AFTER_TURN_M = 0.56f;
-static const float FRONT_FINISH_STOP_M = 0.34f;
+static const float FRONT_FINISH_STOP_M = 0.36f;
 
 static const float SIDE_TOO_CLOSE_M = BODY_HALF_WIDTH_M + 0.045f;      // about 16 cm from lidar to wall
 static const float SIDE_EMERGENCY_M = BODY_HALF_WIDTH_M + 0.025f;      // about 14 cm from lidar to wall
@@ -77,36 +77,39 @@ static const float YAW_OK_M = 0.075f;
 static const float TURN_EXIT_YAW_OK_M = 0.150f;
 
 // -------- Motion tuning, logical PWM range is -100..100 --------
-static const int STRAIGHT_FAST_PWM = 78;
-static const int STRAIGHT_SLOW_PWM = 28;
-static const int ALIGN_FORWARD_PWM = 18;
-static const int ALIGN_ROTATE_PWM = 34;
-static const int TURN_ROTATE_FAST_PWM = 46;
-static const int TURN_ROTATE_SLOW_PWM = 38;
+static const int STRAIGHT_FAST_PWM = 100;
+static const int STRAIGHT_SLOW_PWM = 36;
+static const int ALIGN_FORWARD_PWM = 24;
+static const int ALIGN_ROTATE_PWM = 36;
+static const int PRE_TURN_ROTATE_PWM = 12;
+static const int CORNER_APPROACH_FORWARD_PWM = 12;
+static const int TURN_ROTATE_FAST_PWM = 54;
+static const int TURN_ROTATE_SLOW_PWM = 42;
 static const int TURN_ROTATE_FINE_PWM = 38;
-static const int TURN_EXIT_FORWARD_PWM = 8;
-static const int CORNER_BACKOFF_PWM = 16;
+static const int TURN_ARC_FORWARD_PWM = 8;
+static const int TURN_EXIT_FORWARD_PWM = 10;
+static const int CORNER_BACKOFF_PWM = 18;
 
 static const float STRAFE_KP = 145.0f;
 static const float YAW_KP = 110.0f;
 static const int STRAFE_LIMIT_PWM = 28;
 static const int TURN_STRAFE_LIMIT_PWM = 18;
 static const int YAW_LIMIT_STRAIGHT_PWM = 17;
-static const int YAW_LIMIT_ALIGN_PWM = 24;
+static const int YAW_LIMIT_ALIGN_PWM = 26;
 
 // -------- Time/debounce tuning --------
 static const unsigned long DEBUG_PERIOD_MS = 700;
 static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
-static const unsigned long ALIGN_MIN_MS = 260;
-static const unsigned long ALIGN_MAX_MS = 1400;
-static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 850;
-static const unsigned long CORNER_DECIDE_MAX_MS = 1000;
-static const unsigned long TURN_OPEN_LOOP_MIN_MS = 920;
-static const unsigned long TURN_SENSOR_MIN_MS = 1050;
-static const unsigned long TURN_FAST_MS = 760;
-static const unsigned long TURN_SOFT_MAX_MS = 1550;
-static const unsigned long TURN_MAX_MS = 2300;
+static const unsigned long ALIGN_MIN_MS = 220;
+static const unsigned long ALIGN_MAX_MS = 1200;
+static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 700;
+static const unsigned long CORNER_DECIDE_MAX_MS = 750;
+static const unsigned long TURN_OPEN_LOOP_MIN_MS = 640;
+static const unsigned long TURN_SENSOR_MIN_MS = 760;
+static const unsigned long TURN_FAST_MS = 460;
+static const unsigned long TURN_SOFT_MAX_MS = 1180;
+static const unsigned long TURN_MAX_MS = 1850;
 static const unsigned long TURN_FAILSAFE_BACKOFF_MS = 180;
 static const unsigned long FINISH_MIN_MS = 550;
 static const unsigned long LIDAR_RECOVER_PERIOD_MS = 1500;
@@ -760,6 +763,14 @@ static void updateStraight(const ScanFeatures &features) {
 
   if (cornerConfirm >= CORNER_CONFIRM_SCANS) {
     captureCurrentLegAtCorner();
+    if (lockedTurnDirection == TURN_RIGHT) {
+      enterState(STATE_TURN_RIGHT);
+      return;
+    }
+    if (lockedTurnDirection == TURN_LEFT) {
+      enterState(STATE_TURN_LEFT);
+      return;
+    }
     enterState(STATE_CORNER_DECIDE);
     return;
   }
@@ -777,6 +788,11 @@ static void updateStraight(const ScanFeatures &features) {
 
   int strafe = sideCorrectionPwm(features);
   int rotate = yawCorrectionPwm(features, YAW_LIMIT_STRAIGHT_PWM);
+
+  if (lockedTurnDirection != TURN_UNKNOWN && statCloserThan(features.frontWide, FRONT_SLOW_M)) {
+    int preTurn = (lockedTurnDirection == TURN_RIGHT) ? PRE_TURN_ROTATE_PWM : -PRE_TURN_ROTATE_PWM;
+    rotate = clampInt(rotate + preTurn, -YAW_LIMIT_ALIGN_PWM, YAW_LIMIT_ALIGN_PWM);
+  }
 
   if (fabs(yawError(features)) > 0.14f) {
     forward = min(forward, STRAIGHT_SLOW_PWM);
@@ -814,16 +830,29 @@ static void updateCornerDecide(const ScanFeatures &features) {
     return;
   }
 
-  if (elapsed > CORNER_DECIDE_MAX_MS && detected != TURN_UNKNOWN) {
-    lockedTurnDirection = detected;
-    currentTurnDirection = detected;
+  if (elapsed > CORNER_DECIDE_MAX_MS) {
+    TurnDirection fallback = detected != TURN_UNKNOWN ? detected : fallbackCornerDirection(features);
+    if (fallback != TURN_UNKNOWN) {
+      lockedTurnDirection = fallback;
+      currentTurnDirection = fallback;
+      enterState(currentTurnDirection == TURN_RIGHT ? STATE_TURN_RIGHT : STATE_TURN_LEFT);
+      return;
+    }
+  }
+
+  if (elapsed > CORNER_DECIDE_MAX_MS + 450 && currentTurnDirection != TURN_UNKNOWN) {
+    lockedTurnDirection = currentTurnDirection;
     enterState(currentTurnDirection == TURN_RIGHT ? STATE_TURN_RIGHT : STATE_TURN_LEFT);
     return;
   }
 
   int strafe = sideCorrectionPwm(features);
-  int forward = frontIsDangerouslyClose(features) ? -CORNER_BACKOFF_PWM : 10;
-  driveVector(forward, strafe, 0);
+  int forward = frontIsDangerouslyClose(features) ? -CORNER_BACKOFF_PWM : CORNER_APPROACH_FORWARD_PWM;
+  int rotate = 0;
+  if (detected != TURN_UNKNOWN) {
+    rotate = (detected == TURN_RIGHT) ? PRE_TURN_ROTATE_PWM : -PRE_TURN_ROTATE_PWM;
+  }
+  driveVector(forward, strafe, rotate);
 }
 
 static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDirection) {
@@ -873,6 +902,9 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
     }
   } else if (frontIsClear(features) && elapsed > TURN_SENSOR_MIN_MS) {
     forward = TURN_EXIT_FORWARD_PWM;
+  } else if (!usable(features.front) ||
+             features.front.near > FRONT_HARD_BRAKE_M + 0.08f) {
+    forward = TURN_ARC_FORWARD_PWM;
   }
 
   driveVector(forward, strafe, rotate);

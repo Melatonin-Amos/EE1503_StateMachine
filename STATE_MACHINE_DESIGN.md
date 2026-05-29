@@ -61,20 +61,34 @@ STATE_STOPPED
 
 方向无关性来自第一次弯道检测：第一次识别右开口就锁定右转，第一次识别左开口就锁定左转。因此同一份程序可用于顺时针和逆时针。
 
+## 本轮提速摘要
+
+当前版本在不改底层 `-100..100` 输出限幅的前提下做全面提速：
+
+- 直道巡航 `STRAIGHT_FAST_PWM` 提到 100，慢速档从 28 提到 36。
+- 入弯减速区从 `0.70m` 提前到 `0.84m`，给满速直道留制动距离。
+- 第一次转弯仍识别并锁定方向；第二到第四个弯已知方向后直接进入转弯状态，不再额外停留判向。
+- 第一次弯道如果强判向没有及时确认，750ms 后使用弱判向兜底，避免在弯口长时间慢走。
+- 已锁定方向后，接近弯口会加入轻微预转 `PRE_TURN_ROTATE_PWM = 12`。
+- 转弯状态保留轻量行进间转弯：安全距离内给 `TURN_ARC_FORWARD_PWM = 8`，出弯清空后给 `TURN_EXIT_FORWARD_PWM = 10`。
+- 为抑制转弯过头，旋转速度从上一轮的 58/46 调到 54/42，仍高于旧稳态版本的 46/38。
+- 出弯对齐等待仍短于旧版，但比上一轮略回稳：`ALIGN_MIN_MS = 220ms`，`ALIGN_MAX_MS = 1200ms`。
+
 ## 直行速度控制
 
-当前只对直行巡航做了提速，电机输出限幅仍保持 `-100..100`，没有改到底层 125。
+当前直行和转弯都已提速，但电机输出限幅仍保持 `-100..100`，没有改到底层 125。
 
 ```cpp
 // Motion tuning, logical PWM range is -100..100
-static const int STRAIGHT_FAST_PWM = 78;
-static const int STRAIGHT_SLOW_PWM = 28;
+static const int STRAIGHT_FAST_PWM = 100;
+static const int STRAIGHT_SLOW_PWM = 36;
 ```
 
-旧值为：
+历史值为：
 
 ```cpp
 static const int STRAIGHT_FAST_PWM = 52;
+// 中间版本曾小步提速为 78，再到 90
 ```
 
 所以之前体感不到全速是正常的：`STATE_STRAIGHT` 和 `STATE_FINISH_STRAIGHT` 的基础前进量并不是 100，而是 `STRAIGHT_FAST_PWM`。此外还有两个主动降速条件：
@@ -93,14 +107,16 @@ if (fabs(yawError(features)) > 0.14f) {
 
 含义：
 
-- 前方宽扇区距离小于 `FRONT_SLOW_M = 0.70m` 时，直行速度会从 78 线性降到 28。
-- 前方宽扇区距离小于 `FRONT_TURN_TRIGGER_M = 0.42m` 并确认后，进入转弯判断。
-- 偏航误差过大时，直行速度被限制到 28，优先把车头修正回来。
+- 前方宽扇区距离小于 `FRONT_SLOW_M = 0.84m` 时，直行速度会从 100 线性降到 36。
+- 前方宽扇区距离小于 `FRONT_TURN_TRIGGER_M = 0.44m` 并确认后，进入转弯。
+- 偏航误差过大时，直行速度被限制到 36，优先把车头修正回来。
+- 已锁定转弯方向后，进入减速区会叠加轻微预转，减少到弯口后的原地转动时间。
 
 调参建议：
 
-- 如果直道仍慢，优先把 `STRAIGHT_FAST_PWM` 从 78 试到 85 或 90。
-- 如果入弯太冲，不要先降 `STRAIGHT_FAST_PWM`，优先增大 `FRONT_SLOW_M`，例如 0.70 -> 0.78。
+- 现在直道已经试到 100；如果入弯仍稳，可以保持这个值。
+- 如果入弯太冲，不要先降 `STRAIGHT_FAST_PWM`，优先增大 `FRONT_SLOW_M`，例如 0.84 -> 0.90。
+- 如果预转导致擦内侧墙，先降低 `PRE_TURN_ROTATE_PWM`，例如 12 -> 8。
 - 如果直行容易左右摆，先降低 `STRAIGHT_FAST_PWM` 或 `YAW_LIMIT_STRAIGHT_PWM`，不要直接改转弯状态。
 
 ## 混控和限幅
@@ -133,20 +149,37 @@ int duty = constrain(abs(speed), 0, 100);
 
 因此当前版本即使某处误给了大于 100 的值，也不会真正输出超过 100。
 
+注意：直道 `forward=100` 时，如果同时叠加横移和偏航修正，混控会按比例缩放四个轮子的实际输出。因此串口里的 `cmd=100,...,...` 表示期望向量，实际单轮会受 100 限幅保护。转弯参数有意留了余量，例如 `forward=8 + rotate=54 + strafe<=18` 时最大单轮约 80，通常不会触发缩放。
+
 ## 转弯策略
 
-本轮没有改转弯参数。转弯仍由以下量控制：
+当前转弯参数：
 
 ```cpp
-static const int TURN_ROTATE_FAST_PWM = 46;
-static const int TURN_ROTATE_SLOW_PWM = 38;
+static const int PRE_TURN_ROTATE_PWM = 12;
+static const int CORNER_APPROACH_FORWARD_PWM = 12;
+static const int TURN_ROTATE_FAST_PWM = 54;
+static const int TURN_ROTATE_SLOW_PWM = 42;
 static const int TURN_ROTATE_FINE_PWM = 38;
-static const int TURN_EXIT_FORWARD_PWM = 8;
+static const int TURN_ARC_FORWARD_PWM = 8;
+static const int TURN_EXIT_FORWARD_PWM = 10;
 ```
 
-转弯退出条件在 `turnExitReady()`：等待最小转弯时间、前方重新变空、侧墙可用，再检查偏航误差。这个策略偏稳，转弯体感慢主要来自旋转 PWM 和最小时间，而不是直行 `forward`。
+转弯退出条件在 `turnExitReady()`：等待最小转弯时间、前方重新变空、侧墙可用，再检查偏航误差。当前最小传感器退出时间为 `TURN_SENSOR_MIN_MS = 760ms`，比旧值 1050ms 更短。上一轮由于预转、弧形前进和 58 的高速旋转叠加后容易过头，本轮主要通过调参削掉过冲，不新增状态逻辑。
 
-如果后续要专门提速转弯，建议单独开一轮改动，优先小步提高 `TURN_ROTATE_FAST_PWM`，并保留 `TURN_ROTATE_FINE_PWM`，避免出弯过冲。
+转弯流程现在分三段：
+
+1. 入弯前：已锁定方向时，`STATE_STRAIGHT` 在减速区叠加小预转。
+2. 弯中：`STATE_TURN_RIGHT/LEFT` 使用更高旋转速度，并在前方不危险时带少量前进，减少纯原地旋转时间。
+3. 出弯：前方清空后继续带小前进量，同时等待侧墙和偏航满足退出条件，随后进入 `ALIGN_AFTER_TURN` 做短对齐。
+
+第一次弯道仍需要识别方向。强判向连续确认优先；若 `CORNER_DECIDE_MAX_MS = 750ms` 后仍未强确认，会使用 `fallbackCornerDirection()` 的弱分数兜底。方向一旦锁定，后续弯道不再进入完整判向流程。
+
+如果后续还要提速转弯，优先观察是否过冲：
+
+- 过冲或出弯蛇形：降低 `TURN_ROTATE_FAST_PWM`，例如 54 -> 50，或增大 `TURN_SENSOR_MIN_MS`。
+- 弯中贴近前墙：降低 `TURN_ARC_FORWARD_PWM`，例如 8 -> 6，或增大 `FRONT_HARD_BRAKE_M`。
+- 出弯停顿仍明显：适度降低 `ALIGN_MAX_MS`，或放宽 `YAW_OK_M`，但要确认不会影响下一条直道居中。
 
 ## 串口观察字段
 
@@ -166,4 +199,4 @@ leg        当前直道累计进度
 finish     终点补足进度
 ```
 
-这次提速后，直道空旷且姿态正常时，`cmd` 的第一项应接近 `78`。如果经常只有 `28`，通常说明前方已经进入减速区，或 `YE` 超过了 `0.14`。
+这次提速后，直道空旷且姿态正常时，`cmd` 的第一项应接近 `100`。如果经常只有 `36`，通常说明前方已经进入减速区，或 `YE` 超过了 `0.14`。转弯时应能看到 `cmd` 同时带有 forward 和 rotate，例如 `8,*,54` 附近，而不是长期 `0,*,46`。
