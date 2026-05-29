@@ -77,7 +77,7 @@ static const float YAW_OK_M = 0.075f;
 static const float TURN_EXIT_YAW_OK_M = 0.150f;
 
 // -------- Motion tuning, logical PWM range is -100..100 --------
-static const int STRAIGHT_FAST_PWM = 52;
+static const int STRAIGHT_FAST_PWM = 78;
 static const int STRAIGHT_SLOW_PWM = 28;
 static const int ALIGN_FORWARD_PWM = 18;
 static const int ALIGN_ROTATE_PWM = 34;
