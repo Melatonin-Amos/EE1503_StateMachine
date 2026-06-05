@@ -4,20 +4,27 @@
 #include "LocalMecanumDriver.h"
 
 /*
-  Rectangular blue-foam track state machine.
+  Figure-8 (8字形) foam track state machine.
 
-  Assumptions from the car:
+  Track layout: a rectangular loop with a crossbar through the middle that
+  forms a figure-8. The car starts on the crossbar, travelling toward the
+  first T-junction.
+
+  Route (one full lap = 8 turns):
+    Half A (4 right turns): crossbar → T-junction right → corner right →
+                             corner right → T-junction right → back on crossbar
+    Half B (4 left turns):  crossbar → T-junction left → corner left →
+                             corner left → T-junction left → back on crossbar
+  Then flip direction and repeat indefinitely.
+
+  T-junctions look identical to normal corners from the LiDAR's perspective
+  (front wall present, one side open), so the same corner-detection logic works.
+
+  Lidar angle convention:
     lidar 180 deg -> car front/head, about 8 cm behind the front bumper
     lidar   0 deg -> car rear/tail, about 20 cm in front of the rear bumper
     lidar  90 deg -> car left side
     lidar 270 deg -> car right side
-
-  The program is intentionally direction-neutral. Put the car on any straight
-  section facing the desired travel direction. At the first corner it detects
-  whether the open corridor is on the right or on the left, locks that turn
-  direction, completes four same-direction quarter-turns, then estimates the
-  remaining distance to the original start point from the opposite full side
-  length and stops.
 
   Mecanum command convention:
     forward      = ( +, +, +, + )
@@ -63,10 +70,9 @@ static const float FRONT_SLOW_M = 0.84f;
 static const float FRONT_TURN_TRIGGER_M = 0.44f;
 static const float FRONT_HARD_BRAKE_M = 0.25f;
 static const float FRONT_CLEAR_AFTER_TURN_M = 0.56f;
-static const float FRONT_FINISH_STOP_M = 0.36f;
 
-static const float SIDE_TOO_CLOSE_M = BODY_HALF_WIDTH_M + 0.045f;      // about 16 cm from lidar to wall
-static const float SIDE_EMERGENCY_M = BODY_HALF_WIDTH_M + 0.025f;      // about 14 cm from lidar to wall
+static const float SIDE_TOO_CLOSE_M = BODY_HALF_WIDTH_M + 0.045f;
+static const float SIDE_EMERGENCY_M = BODY_HALF_WIDTH_M + 0.025f;
 static const float SIDE_VALID_MAX_M = 0.64f;
 static const float SIDE_OPEN_M = 0.48f;
 static const float DIAGONAL_OPEN_M = 0.52f;
@@ -113,13 +119,15 @@ static const unsigned long TURN_FAST_MS = 460;
 static const unsigned long TURN_SOFT_MAX_MS = 1180;
 static const unsigned long TURN_MAX_MS = 1850;
 static const unsigned long TURN_FAILSAFE_BACKOFF_MS = 180;
-static const unsigned long FINISH_MIN_MS = 550;
 static const unsigned long LIDAR_RECOVER_PERIOD_MS = 1500;
 
 static const int CORNER_CONFIRM_SCANS = 2;
 static const int TURN_DECISION_CONFIRM_SCANS = 2;
 static const int READY_CONFIRM_SCANS = 2;
 static const int LOST_TRACK_CONFIRM_SCANS = 8;
+
+// Number of same-direction turns per half-lap before flipping direction.
+static const int TURNS_PER_HALF_LAP = 4;
 
 enum TrackState {
   STATE_ACQUIRE_STRAIGHT = 1,
@@ -128,8 +136,7 @@ enum TrackState {
   STATE_TURN_RIGHT = 4,
   STATE_TURN_LEFT = 5,
   STATE_ALIGN_AFTER_TURN = 6,
-  STATE_FINISH_STRAIGHT = 7,
-  STATE_STOPPED = 8
+  STATE_STOPPED = 7
 };
 
 enum TurnDirection {
@@ -167,19 +174,15 @@ static TrackState state = STATE_ACQUIRE_STRAIGHT;
 static TurnDirection lockedTurnDirection = TURN_UNKNOWN;
 static TurnDirection currentTurnDirection = TURN_UNKNOWN;
 
+// completedTurns: turns completed within the current half-lap (resets every TURNS_PER_HALF_LAP)
 static int completedTurns = 0;
+// halfLaps: total half-laps completed (each half-lap = TURNS_PER_HALF_LAP turns)
+static int halfLaps = 0;
 static int cornerConfirm = 0;
 static int readyConfirm = 0;
 static int decisionConfirm = 0;
 static int lostTrackConfirm = 0;
 
-static bool finishPendingAfterAlign = false;
-
-static bool legCaptured[4] = { false, false, false, false };
-static float legProgress[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-static float currentLegProgress = 0.0f;
-static float finishProgress = 0.0f;
-static float finishTargetProgress = 0.0f;
 static int lastForwardCommand = 0;
 static int lastStrafeCommand = 0;
 static int lastRotateCommand = 0;
@@ -227,16 +230,13 @@ static void driveVector(int forward, int strafeRight, int rotateRight);
 static const char *stateName(TrackState value);
 static const char *turnName(TurnDirection value);
 static void enterState(TrackState nextState);
-static void captureCurrentLegAtCorner();
-static float estimateFinishTargetProgress();
-static void addProgress(float &progress, int forwardPwm);
+static void onHalfLapComplete(const ScanFeatures &features);
 static void printDebug(const ScanFeatures &features);
 static void updateAcquireStraight(const ScanFeatures &features);
 static void updateStraight(const ScanFeatures &features);
 static void updateCornerDecide(const ScanFeatures &features);
 static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDirection);
 static void updateAlignAfterTurn(const ScanFeatures &features);
-static void updateFinishStraight(const ScanFeatures &features);
 static void updateTrackState(const ScanFeatures &features);
 static void storeLidarPoint(float distanceM, float angleDeg);
 static bool requestLidarScan();
@@ -385,7 +385,6 @@ static float sideCenterError(const ScanFeatures &features) {
   bool rightOk = usable(features.right) && features.right.near < SIDE_VALID_MAX_M;
 
   if (leftOk && rightOk) {
-    // Positive means "too close to the left wall", so strafe right.
     return features.right.near - features.left.near;
   }
 
@@ -535,8 +534,6 @@ static bool turnExitReady(const ScanFeatures &features, unsigned long elapsed) {
     return true;
   }
 
-  // Prefer leaving the high-speed turn early and letting ALIGN_AFTER_TURN fix
-  // the last few degrees instead of rotating until a bad scan causes overrun.
   return elapsed >= TURN_SOFT_MAX_MS && fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 1.6f;
 }
 
@@ -591,22 +588,21 @@ static void driveVector(int forward, int strafeRight, int rotateRight) {
 static const char *stateName(TrackState value) {
   switch (value) {
     case STATE_ACQUIRE_STRAIGHT: return "ACQUIRE_STRAIGHT";
-    case STATE_STRAIGHT: return "STRAIGHT";
-    case STATE_CORNER_DECIDE: return "CORNER_DECIDE";
-    case STATE_TURN_RIGHT: return "TURN_RIGHT";
-    case STATE_TURN_LEFT: return "TURN_LEFT";
+    case STATE_STRAIGHT:         return "STRAIGHT";
+    case STATE_CORNER_DECIDE:    return "CORNER_DECIDE";
+    case STATE_TURN_RIGHT:       return "TURN_RIGHT";
+    case STATE_TURN_LEFT:        return "TURN_LEFT";
     case STATE_ALIGN_AFTER_TURN: return "ALIGN_AFTER_TURN";
-    case STATE_FINISH_STRAIGHT: return "FINISH_STRAIGHT";
-    case STATE_STOPPED: return "STOPPED";
-    default: return "UNKNOWN";
+    case STATE_STOPPED:          return "STOPPED";
+    default:                     return "UNKNOWN";
   }
 }
 
 static const char *turnName(TurnDirection value) {
   switch (value) {
     case TURN_RIGHT: return "RIGHT";
-    case TURN_LEFT: return "LEFT";
-    default: return "UNKNOWN";
+    case TURN_LEFT:  return "LEFT";
+    default:         return "UNKNOWN";
   }
 }
 
@@ -619,70 +615,34 @@ static void enterState(TrackState nextState) {
   decisionConfirm = 0;
   lastTurnBackoffMs = 0;
 
-  if (state == STATE_FINISH_STRAIGHT) {
-    finishProgress = 0.0f;
-    finishTargetProgress = estimateFinishTargetProgress();
-  }
-
-  if (state == STATE_STRAIGHT) {
-    currentLegProgress = 0.0f;
-  }
-
-  Serial.printf("STATE -> %s | turn=%s | turns=%d | leg=%.0f | target=%.0f | finish=%s\r\n",
+  Serial.printf("STATE -> %s | turn=%s | half=%d | turns_in_half=%d\r\n",
                 stateName(state),
                 turnName(lockedTurnDirection),
-                completedTurns,
-                currentLegProgress,
-                finishTargetProgress,
-                finishPendingAfterAlign ? "yes" : "no");
+                halfLaps,
+                completedTurns);
 
   if (state == STATE_STOPPED) {
     driveRaw(0, 0, 0, 0);
   }
 }
 
-static void captureCurrentLegAtCorner() {
-  if (completedTurns < 0 || completedTurns >= 4) {
-    return;
-  }
+// Called when the 4th turn of a half-lap finishes. Flips direction for the next half.
+static void onHalfLapComplete(const ScanFeatures &features) {
+  halfLaps++;
+  completedTurns = 0;
 
-  legProgress[completedTurns] = currentLegProgress;
-  legCaptured[completedTurns] = true;
+  // Flip the locked direction for the next half-lap.
+  lockedTurnDirection = (lockedTurnDirection == TURN_RIGHT) ? TURN_LEFT : TURN_RIGHT;
 
-  Serial.printf("LEG_CAPTURED index=%d progress=%.0f clearance=%.2f side_target=%.2f\r\n",
-                completedTurns,
-                currentLegProgress,
-                NOMINAL_SIDE_CLEARANCE_M,
-                SIDE_TARGET_M);
-}
+  Serial.printf("HALF_LAP_DONE total_halves=%d next_turn=%s\r\n",
+                halfLaps,
+                turnName(lockedTurnDirection));
 
-static float estimateFinishTargetProgress() {
-  const float minProgress = (float)STRAIGHT_FAST_PWM * 650.0f;
-  const float defaultProgress = (float)STRAIGHT_FAST_PWM * 1500.0f;
-
-  float firstPartial = legCaptured[0] ? legProgress[0] : 0.0f;
-  float oppositeFull = legCaptured[2] ? legProgress[2] : 0.0f;
-
-  if (oppositeFull > minProgress) {
-    float remaining = oppositeFull - firstPartial;
-    return remaining > minProgress ? remaining : minProgress;
-  }
-
-  if (firstPartial > minProgress) {
-    return firstPartial;
-  }
-
-  return defaultProgress;
-}
-
-static void addProgress(float &progress, int forwardPwm) {
-  unsigned long now = millis();
-  unsigned long dt = now - lastMotionUpdateMs;
-  lastMotionUpdateMs = now;
-
-  if (forwardPwm > 0 && dt < 1000) {
-    progress += (float)forwardPwm * (float)dt;
-  }
+  bool skipAlign = frontIsClear(features) &&
+                   sideWallsUsable(features) &&
+                   yawDataUsable(features) &&
+                   fabs(yawError(features)) < ALIGN_YAW_OK_M;
+  enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
 }
 
 static void printDebug(const ScanFeatures &features) {
@@ -695,11 +655,12 @@ static void printDebug(const ScanFeatures &features) {
   unsigned long elapsed = now - stateStartMs;
 
   Serial.printf(
-    "#%lu %s ms=%lu turn=%s n=%d ready=%d F=%.2f FW=%.2f L=%.2f R=%.2f LF=%.2f RF=%.2f CE=%.2f YE=%.2f cmd=%d,%d,%d leg=%.0f finish=%.0f/%.0f\r\n",
+    "#%lu %s ms=%lu turn=%s half=%d n=%d ready=%d F=%.2f FW=%.2f L=%.2f R=%.2f LF=%.2f RF=%.2f CE=%.2f YE=%.2f cmd=%d,%d,%d\r\n",
     scanIndex,
     stateName(state),
     elapsed,
     turnName(lockedTurnDirection),
+    halfLaps,
     completedTurns,
     readyConfirm,
     features.front.near,
@@ -712,10 +673,7 @@ static void printDebug(const ScanFeatures &features) {
     yawError(features),
     lastForwardCommand,
     lastStrafeCommand,
-    lastRotateCommand,
-    currentLegProgress,
-    finishProgress,
-    finishTargetProgress
+    lastRotateCommand
   );
 }
 
@@ -764,7 +722,6 @@ static void updateStraight(const ScanFeatures &features) {
   }
 
   if (cornerConfirm >= CORNER_CONFIRM_SCANS) {
-    captureCurrentLegAtCorner();
     if (lockedTurnDirection == TURN_RIGHT) {
       enterState(STATE_TURN_RIGHT);
       return;
@@ -801,7 +758,6 @@ static void updateStraight(const ScanFeatures &features) {
   }
 
   driveVector(forward, strafe, rotate);
-  addProgress(currentLegProgress, forward);
 }
 
 static void updateCornerDecide(const ScanFeatures &features) {
@@ -868,17 +824,16 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
 
   if (readyConfirm >= READY_CONFIRM_SCANS) {
     completedTurns++;
-    if (completedTurns >= 4) {
-      finishPendingAfterAlign = true;
-    }
-    bool skipAlign = frontIsClear(features) &&
-                     sideWallsUsable(features) &&
-                     yawDataUsable(features) &&
-                     fabs(yawError(features)) < ALIGN_YAW_OK_M;
-    if (skipAlign) {
-      enterState(finishPendingAfterAlign ? STATE_FINISH_STRAIGHT : STATE_STRAIGHT);
+
+    if (completedTurns >= TURNS_PER_HALF_LAP) {
+      // Half-lap done: flip direction and continue.
+      onHalfLapComplete(features);
     } else {
-      enterState(STATE_ALIGN_AFTER_TURN);
+      bool skipAlign = frontIsClear(features) &&
+                       sideWallsUsable(features) &&
+                       yawDataUsable(features) &&
+                       fabs(yawError(features)) < ALIGN_YAW_OK_M;
+      enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
     }
     return;
   }
@@ -941,11 +896,7 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
 
   if (readyConfirm >= READY_CONFIRM_SCANS ||
       (elapsed >= ALIGN_MAX_MS && frontIsClear(features) && sideWallsUsable(features))) {
-    if (finishPendingAfterAlign) {
-      enterState(STATE_FINISH_STRAIGHT);
-    } else {
-      enterState(STATE_STRAIGHT);
-    }
+    enterState(STATE_STRAIGHT);
     return;
   }
 
@@ -961,28 +912,6 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
   }
 
   driveVector(forward, strafe, rotate);
-}
-
-static void updateFinishStraight(const ScanFeatures &features) {
-  unsigned long elapsed = millis() - stateStartMs;
-
-  if ((elapsed >= FINISH_MIN_MS && finishProgress >= finishTargetProgress) ||
-      statCloserThan(features.frontWide, FRONT_FINISH_STOP_M)) {
-    enterState(STATE_STOPPED);
-    return;
-  }
-
-  int forward = STRAIGHT_FAST_PWM;
-  if (statCloserThan(features.frontWide, FRONT_SLOW_M)) {
-    float ratio = (features.frontWide.near - FRONT_FINISH_STOP_M) / (FRONT_SLOW_M - FRONT_FINISH_STOP_M);
-    ratio = clampFloat(ratio, 0.0f, 1.0f);
-    forward = STRAIGHT_SLOW_PWM + (int)((STRAIGHT_FAST_PWM - STRAIGHT_SLOW_PWM) * ratio);
-  }
-
-  int strafe = sideCorrectionPwm(features);
-  int rotate = yawCorrectionPwm(features, YAW_LIMIT_STRAIGHT_PWM);
-  driveVector(forward, strafe, rotate);
-  addProgress(finishProgress, forward);
 }
 
 static void updateTrackState(const ScanFeatures &features) {
@@ -1022,9 +951,6 @@ static void updateTrackState(const ScanFeatures &features) {
       break;
     case STATE_ALIGN_AFTER_TURN:
       updateAlignAfterTurn(features);
-      break;
-    case STATE_FINISH_STRAIGHT:
-      updateFinishStraight(features);
       break;
     case STATE_STOPPED:
     default:
@@ -1084,7 +1010,7 @@ void setup() {
   lastDebugMs = millis();
   lastRecoverMs = millis() - LIDAR_RECOVER_PERIOD_MS;
 
-  Serial.println("Main rectangular-track state machine ready");
+  Serial.println("Figure-8 track state machine ready");
   Serial.printf("track_width=%.2f car_width=%.2f side_target=%.2f front_offset=%.2f\r\n",
                 TRACK_WIDTH_M,
                 CAR_WIDTH_M,
