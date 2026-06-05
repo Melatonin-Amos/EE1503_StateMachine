@@ -99,9 +99,17 @@ enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
 
 ### 方向识别
 
-第一次转弯时 `lockedTurnDirection == TURN_UNKNOWN`，进入 `STATE_CORNER_DECIDE` 识别方向并锁定。  
-之后每次转弯方向已知，直接进 `STATE_TURN_RIGHT` 或 `STATE_TURN_LEFT`，跳过判向流程。  
+`lockedTurnDirection` 在 `setup()` 中由 `INITIAL_TURN_DIRECTION = TURN_RIGHT` 预设，上电即已锁定。  
+每次到弯口直接进 `STATE_TURN_RIGHT` 或 `STATE_TURN_LEFT`，完全跳过 `STATE_CORNER_DECIDE`。  
 每个半圈结束时翻转方向，下一个半圈仍直接按锁定方向转弯。
+
+**为何预设而不靠识别：** 8字赛道的起点是横道中段，首次到T字口时横道两侧都有开口，`detectedCornerDirection()` 得分差可能不足 `margin = 0.45`，导致在 `CORNER_DECIDE` 里慢行直至 750ms 超时，再等 `fallbackCornerDirection` 兜底，合计可能停顿超过 1 秒。路线已知（始终右转开始），预设最可靠。
+
+若需要换成左转开始，只需改：
+
+```cpp
+static const TurnDirection INITIAL_TURN_DIRECTION = TURN_LEFT;
+```
 
 ## 转弯策略
 

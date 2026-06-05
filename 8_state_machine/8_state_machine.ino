@@ -145,6 +145,12 @@ enum TurnDirection {
   TURN_LEFT = -1
 };
 
+// First half-lap direction. The figure-8 route always starts with right turns
+// out of the crossbar, so we pre-seed the locked direction here instead of
+// relying on CORNER_DECIDE at the first T-junction (which can stall when both
+// sides look partially open in the crossbar geometry).
+static const TurnDirection INITIAL_TURN_DIRECTION = TURN_RIGHT;
+
 struct RangeStat {
   int count;
   float near;
@@ -1016,6 +1022,7 @@ void setup() {
                 CAR_WIDTH_M,
                 SIDE_TARGET_M,
                 LIDAR_TO_FRONT_BUMPER_M);
+  lockedTurnDirection = INITIAL_TURN_DIRECTION;
   requestLidarScan();
   enterState(STATE_ACQUIRE_STRAIGHT);
 }
