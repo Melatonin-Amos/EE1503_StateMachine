@@ -70,9 +70,9 @@ STATE_STOPPED
 - 第一次转弯仍识别并锁定方向；第二到第四个弯已知方向后直接进入转弯状态，不再额外停留判向。
 - 第一次弯道如果强判向没有及时确认，750ms 后使用弱判向兜底，避免在弯口长时间慢走。
 - 已锁定方向后，接近弯口会加入轻微预转 `PRE_TURN_ROTATE_PWM = 12`。
-- 转弯状态保留轻量行进间转弯：安全距离内给 `TURN_ARC_FORWARD_PWM = 8`，出弯清空后给 `TURN_EXIT_FORWARD_PWM = 10`。
-- 为抑制转弯过头，旋转速度从上一轮的 58/46 调到 54/42，仍高于旧稳态版本的 46/38。
-- 出弯对齐等待仍短于旧版，但比上一轮略回稳：`ALIGN_MIN_MS = 220ms`，`ALIGN_MAX_MS = 1200ms`。
+- 转弯状态带弧形前进：安全距离内给 `TURN_ARC_FORWARD_PWM = 16`，出弯清空后给 `TURN_EXIT_FORWARD_PWM = 18`。
+- 为抑制转弯过头，加入制动阶段 `TURN_ROTATE_BRAKE_PWM = 22`，精细旋转速度从 38 降到 30；偏航进入 0.300m 窗口时切换到制动速度。
+- 出弯偏航已在 `ALIGN_YAW_OK_M = 0.100m` 以内时直接进直行，跳过 `STATE_ALIGN_AFTER_TURN`，消除反向回正停顿；`ALIGN_MIN_MS` 缩短为 80ms 作为兜底最短等待。
 
 ## 直行速度控制
 
@@ -156,30 +156,31 @@ int duty = constrain(abs(speed), 0, 100);
 当前转弯参数：
 
 ```cpp
-static const int PRE_TURN_ROTATE_PWM = 12;
+static const int PRE_TURN_ROTATE_PWM    = 12;
 static const int CORNER_APPROACH_FORWARD_PWM = 12;
-static const int TURN_ROTATE_FAST_PWM = 54;
-static const int TURN_ROTATE_SLOW_PWM = 42;
-static const int TURN_ROTATE_FINE_PWM = 38;
-static const int TURN_ARC_FORWARD_PWM = 8;
-static const int TURN_EXIT_FORWARD_PWM = 10;
+static const int TURN_ROTATE_FAST_PWM   = 54;
+static const int TURN_ROTATE_SLOW_PWM   = 42;
+static const int TURN_ROTATE_FINE_PWM   = 30;   // 历史值 38
+static const int TURN_ROTATE_BRAKE_PWM  = 22;   // 新增
+static const int TURN_ARC_FORWARD_PWM   = 16;   // 历史值 8
+static const int TURN_EXIT_FORWARD_PWM  = 18;   // 历史值 10
 ```
 
-转弯退出条件在 `turnExitReady()`：等待最小转弯时间、前方重新变空、侧墙可用，再检查偏航误差。当前最小传感器退出时间为 `TURN_SENSOR_MIN_MS = 760ms`，比旧值 1050ms 更短。上一轮由于预转、弧形前进和 58 的高速旋转叠加后容易过头，本轮主要通过调参削掉过冲，不新增状态逻辑。
+转弯退出条件在 `turnExitReady()`：等待最小转弯时间、前方重新变空、侧墙可用，再检查偏航误差。当前最小传感器退出时间为 `TURN_SENSOR_MIN_MS = 760ms`，比旧值 1050ms 更短。
 
 转弯流程现在分三段：
 
 1. 入弯前：已锁定方向时，`STATE_STRAIGHT` 在减速区叠加小预转。
-2. 弯中：`STATE_TURN_RIGHT/LEFT` 使用更高旋转速度，并在前方不危险时带少量前进，减少纯原地旋转时间。
-3. 出弯：前方清空后继续带小前进量，同时等待侧墙和偏航满足退出条件，随后进入 `ALIGN_AFTER_TURN` 做短对齐。
+2. 弯中：`STATE_TURN_RIGHT/LEFT` 分快速→慢速→精细→制动四档旋转速度，并在前方不危险时带前进分量走弧形，减少纯原地旋转时间。
+3. 出弯：偏航已在 `ALIGN_YAW_OK_M = 0.100m` 以内则直接进直行，否则进 `ALIGN_AFTER_TURN` 做短对齐兜底。
 
 第一次弯道仍需要识别方向。强判向连续确认优先；若 `CORNER_DECIDE_MAX_MS = 750ms` 后仍未强确认，会使用 `fallbackCornerDirection()` 的弱分数兜底。方向一旦锁定，后续弯道不再进入完整判向流程。
 
 如果后续还要提速转弯，优先观察是否过冲：
 
-- 过冲或出弯蛇形：降低 `TURN_ROTATE_FAST_PWM`，例如 54 -> 50，或增大 `TURN_SENSOR_MIN_MS`。
-- 弯中贴近前墙：降低 `TURN_ARC_FORWARD_PWM`，例如 8 -> 6，或增大 `FRONT_HARD_BRAKE_M`。
-- 出弯停顿仍明显：适度降低 `ALIGN_MAX_MS`，或放宽 `YAW_OK_M`，但要确认不会影响下一条直道居中。
+- 过冲或出弯蛇形：降低 `TURN_ROTATE_BRAKE_PWM`（例如 22 → 18），或扩大制动窗口（`* 2.0f` → `* 2.5f`）。
+- 弯中贴近内/外墙：调整 `TURN_ARC_FORWARD_PWM`（例如 16 → 12）。
+- 出弯后直行开头跑偏：收紧 `ALIGN_YAW_OK_M`（例如 0.100 → 0.080）。
 
 ## 串口观察字段
 
@@ -199,4 +200,100 @@ leg        当前直道累计进度
 finish     终点补足进度
 ```
 
-这次提速后，直道空旷且姿态正常时，`cmd` 的第一项应接近 `100`。如果经常只有 `36`，通常说明前方已经进入减速区，或 `YE` 超过了 `0.14`。转弯时应能看到 `cmd` 同时带有 forward 和 rotate，例如 `8,*,54` 附近，而不是长期 `0,*,46`。
+这次提速后，直道空旷且姿态正常时，`cmd` 的第一项应接近 `100`。如果经常只有 `36`，通常说明前方已经进入减速区，或 `YE` 超过了 `0.14`。转弯时应能看到 `cmd` 同时带有 forward 和 rotate，例如 `16,*,54` 附近，而不是长期 `0,*,46`。
+
+## 转弯优化
+
+本节记录针对「转弯略过头」「转弯速度偏低」「出弯停顿过长」三个问题的综合修改。
+
+### 1. 抗过冲：转弯制动阶段
+
+**问题**：转弯以 fine 速（原 38 PWM）旋转时，退出需要 2 次连续确认（各约 100ms），期间惯性导致持续过冲。
+
+**修改**：新增 `TURN_ROTATE_BRAKE_PWM = 22`，并把 `TURN_ROTATE_FINE_PWM` 从 38 降到 30。在 `updateQuarterTurn()` 的旋转量决策中加入制动条件：
+
+```cpp
+static const int TURN_ROTATE_FINE_PWM  = 30;   // 原值 38
+static const int TURN_ROTATE_BRAKE_PWM = 22;   // 新增
+```
+
+```cpp
+if (elapsed >= TURN_OPEN_LOOP_MIN_MS &&
+    yawDataUsable(features) &&
+    fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 2.0f) {
+  rotateMagnitude = TURN_ROTATE_BRAKE_PWM;
+}
+```
+
+当偏航误差进入退出阈值的 2 倍窗口（`0.300m`）时，旋转从 fine（30）降到 brake（22），最后一段接近目标角度时转速已很低，过冲大幅减少。`TURN_MAX_MS` 兜底仍覆盖在最后，防止卡在制动区。
+
+### 2. 提速：加大弧形前进分量
+
+**问题**：`TURN_ARC_FORWARD_PWM = 8` 和 `TURN_EXIT_FORWARD_PWM = 10` 太小，弯中几乎纯原地旋转。
+
+**修改**：
+
+```cpp
+static const int TURN_ARC_FORWARD_PWM  = 16;   // 原值 8
+static const int TURN_EXIT_FORWARD_PWM = 18;   // 原值 10
+```
+
+弧形运动下（forward=16, rotate=54），最大单轮约 70，叠加 strafe ≤ 18 后约 88，不触发 `driveVector` 的比例缩放。
+
+### 3. 出弯直接进直行（跳过 ALIGN）
+
+**问题**：`STATE_ALIGN_AFTER_TURN` 用 `YAW_LIMIT_ALIGN_PWM = 26` 做比例旋转修正，微量过冲时会反向回转，产生可见停顿。制动阶段生效后出弯偏航已很小，这个修正不再必要。
+
+**修改一**：`ALIGN_MIN_MS` 从 220 降到 80，并新增专用阈值 `ALIGN_YAW_OK_M = 0.100f`（介于直行用的 `YAW_OK_M = 0.075m` 和出弯退出用的 `TURN_EXIT_YAW_OK_M = 0.150m` 之间），用于 `updateAlignAfterTurn()` 的退出判断：
+
+```cpp
+static const unsigned long ALIGN_MIN_MS   = 80;      // 原值 220
+static const float         ALIGN_YAW_OK_M = 0.100f;  // 新增
+```
+
+```cpp
+bool ready = sideWallsUsable(features) &&
+             frontIsClear(features) &&
+             yawDataUsable(features) &&
+             fabs(sideCenterError(features)) < CENTER_OK_M &&
+             fabs(yawError(features)) < ALIGN_YAW_OK_M;
+```
+
+`YAW_OK_M = 0.075m` 保持不变，仍用于上电初始对齐（`STATE_ACQUIRE_STRAIGHT`）。
+
+**修改二**：在 `updateQuarterTurn()` 的退出块中，判断是否跳过 ALIGN：
+
+```cpp
+bool skipAlign = frontIsClear(features) &&
+                 sideWallsUsable(features) &&
+                 yawDataUsable(features) &&
+                 fabs(yawError(features)) < ALIGN_YAW_OK_M;
+if (skipAlign) {
+  enterState(finishPendingAfterAlign ? STATE_FINISH_STRAIGHT : STATE_STRAIGHT);
+} else {
+  enterState(STATE_ALIGN_AFTER_TURN);
+}
+```
+
+出弯偏航已在 0.100m 以内时，直接进 `STATE_STRAIGHT`，完全消除反向回正和额外等待。`STATE_STRAIGHT` 自带偏航修正（`YAW_LIMIT_STRAIGHT_PWM = 17`），残余偏航在直行段平滑收敛。出弯偏航 > 0.100m 时（制动未完全生效等异常情况），仍正常进入 `STATE_ALIGN_AFTER_TURN` 兜底。
+
+### 转弯阶段时序与 cmd 预期
+
+| 阶段 | 时间范围 | 旋转速度 | 前进分量 | 触发条件 |
+|------|---------|---------|---------|---------|
+| 快速旋转 | 0–460ms | 54 | 16（前方 > 0.33m 时） | 入弯即生效 |
+| 慢速旋转 | 460ms–640ms | 42 | 16 | `TURN_FAST_MS` 超时 |
+| 精细旋转 | 640ms+ | 30 | 16 或 18 | 前方清空且过 `TURN_OPEN_LOOP_MIN_MS` |
+| 制动旋转 | 640ms+ | 22 | 16 或 18 | 偏航进入 0.300m 窗口 |
+| 超时兜底 | 1850ms+ | 42 | 依前方状态 | `TURN_MAX_MS` |
+
+串口中典型序列：`16,*,54` → `16,*,42` → `16,*,30` → `16,*,22` → 跳出。
+
+### 调参建议
+
+- **仍有过冲**：降低 `TURN_ROTATE_BRAKE_PWM`（22 → 18），或扩大制动窗口（`* 2.0f` → `* 2.5f`）。
+- **制动触发太早、弯中变慢**：把制动触发条件改为 `elapsed >= TURN_SENSOR_MIN_MS`（760ms 起）。
+- **弯中贴近内侧墙**：降低 `TURN_ARC_FORWARD_PWM`（16 → 12）。
+- **弯中贴近外侧墙**：`insideClearanceStrafe()` 已有侧向推开；若仍不够，降低 `TURN_ARC_FORWARD_PWM`。
+- **跳过 ALIGN 后直行开头跑偏**：收紧 `ALIGN_YAW_OK_M`（0.100 → 0.080）。
+- **仍偶发进入 ALIGN 停顿**：放宽 `ALIGN_YAW_OK_M`（0.100 → 0.120）。

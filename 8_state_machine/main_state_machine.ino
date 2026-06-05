@@ -74,6 +74,7 @@ static const float TRACK_PRESENT_MAX_M = 0.95f;
 
 static const float CENTER_OK_M = 0.060f;
 static const float YAW_OK_M = 0.075f;
+static const float ALIGN_YAW_OK_M = 0.100f;
 static const float TURN_EXIT_YAW_OK_M = 0.150f;
 
 // -------- Motion tuning, logical PWM range is -100..100 --------
@@ -85,9 +86,10 @@ static const int PRE_TURN_ROTATE_PWM = 12;
 static const int CORNER_APPROACH_FORWARD_PWM = 12;
 static const int TURN_ROTATE_FAST_PWM = 54;
 static const int TURN_ROTATE_SLOW_PWM = 42;
-static const int TURN_ROTATE_FINE_PWM = 38;
-static const int TURN_ARC_FORWARD_PWM = 8;
-static const int TURN_EXIT_FORWARD_PWM = 10;
+static const int TURN_ROTATE_FINE_PWM = 30;
+static const int TURN_ROTATE_BRAKE_PWM = 22;
+static const int TURN_ARC_FORWARD_PWM = 16;
+static const int TURN_EXIT_FORWARD_PWM = 18;
 static const int CORNER_BACKOFF_PWM = 18;
 
 static const float STRAFE_KP = 145.0f;
@@ -101,7 +103,7 @@ static const int YAW_LIMIT_ALIGN_PWM = 26;
 static const unsigned long DEBUG_PERIOD_MS = 700;
 static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
-static const unsigned long ALIGN_MIN_MS = 220;
+static const unsigned long ALIGN_MIN_MS = 80;
 static const unsigned long ALIGN_MAX_MS = 1200;
 static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 700;
 static const unsigned long CORNER_DECIDE_MAX_MS = 750;
@@ -869,7 +871,15 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
     if (completedTurns >= 4) {
       finishPendingAfterAlign = true;
     }
-    enterState(STATE_ALIGN_AFTER_TURN);
+    bool skipAlign = frontIsClear(features) &&
+                     sideWallsUsable(features) &&
+                     yawDataUsable(features) &&
+                     fabs(yawError(features)) < ALIGN_YAW_OK_M;
+    if (skipAlign) {
+      enterState(finishPendingAfterAlign ? STATE_FINISH_STRAIGHT : STATE_STRAIGHT);
+    } else {
+      enterState(STATE_ALIGN_AFTER_TURN);
+    }
     return;
   }
 
@@ -879,6 +889,11 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
   }
   if (frontIsClear(features) && elapsed > TURN_OPEN_LOOP_MIN_MS) {
     rotateMagnitude = TURN_ROTATE_FINE_PWM;
+  }
+  if (elapsed >= TURN_OPEN_LOOP_MIN_MS &&
+      yawDataUsable(features) &&
+      fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 2.0f) {
+    rotateMagnitude = TURN_ROTATE_BRAKE_PWM;
   }
   if (elapsed > TURN_MAX_MS) {
     rotateMagnitude = TURN_ROTATE_SLOW_PWM;
@@ -912,7 +927,11 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
 
 static void updateAlignAfterTurn(const ScanFeatures &features) {
   unsigned long elapsed = millis() - stateStartMs;
-  bool ready = poseLooksAligned(features);
+  bool ready = sideWallsUsable(features) &&
+               frontIsClear(features) &&
+               yawDataUsable(features) &&
+               fabs(sideCenterError(features)) < CENTER_OK_M &&
+               fabs(yawError(features)) < ALIGN_YAW_OK_M;
 
   if (elapsed >= ALIGN_MIN_MS && ready) {
     readyConfirm++;
