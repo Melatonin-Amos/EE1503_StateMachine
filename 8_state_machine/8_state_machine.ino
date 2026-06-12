@@ -86,7 +86,7 @@ static const float TURN_EXIT_YAW_OK_M = 0.150f;
 // -------- Motion tuning, logical PWM range is -100..100 --------
 static const int STRAIGHT_FAST_PWM = 100;
 static const int STRAIGHT_SLOW_PWM = 36;
-static const int ALIGN_FORWARD_PWM = 24;
+static const int ALIGN_FORWARD_PWM = 36;
 static const int ALIGN_ROTATE_PWM = 36;
 static const int PRE_TURN_ROTATE_PWM = 12;
 static const int CORNER_APPROACH_FORWARD_PWM = 12;
@@ -110,7 +110,7 @@ static const unsigned long DEBUG_PERIOD_MS = 700;
 static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
 static const unsigned long ALIGN_MIN_MS = 80;
-static const unsigned long ALIGN_MAX_MS = 1200;
+static const unsigned long ALIGN_MAX_MS = 500;
 static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 250;
 static const unsigned long CORNER_DECIDE_MAX_MS = 750;
 static const unsigned long TURN_OPEN_LOOP_MIN_MS = 640;
@@ -121,7 +121,7 @@ static const unsigned long TURN_MAX_MS = 1850;
 static const unsigned long TURN_FAILSAFE_BACKOFF_MS = 180;
 static const unsigned long LIDAR_RECOVER_PERIOD_MS = 1500;
 
-static const int CORNER_CONFIRM_SCANS = 2;
+static const int CORNER_CONFIRM_SCANS = 1;
 static const int TURN_DECISION_CONFIRM_SCANS = 2;
 static const int READY_CONFIRM_SCANS = 2;
 static const int LOST_TRACK_CONFIRM_SCANS = 8;
@@ -383,7 +383,11 @@ static bool trackLooksPresent(const ScanFeatures &features) {
   return (usable(features.left) && features.left.near < TRACK_PRESENT_MAX_M) ||
          (usable(features.right) && features.right.near < TRACK_PRESENT_MAX_M) ||
          (usable(features.frontWide) && features.frontWide.near < TRACK_PRESENT_MAX_M) ||
-         (usable(features.rear) && features.rear.near < TRACK_PRESENT_MAX_M);
+         (usable(features.rear) && features.rear.near < TRACK_PRESENT_MAX_M) ||
+         (usable(features.leftFront) && features.leftFront.near < TRACK_PRESENT_MAX_M) ||
+         (usable(features.rightFront) && features.rightFront.near < TRACK_PRESENT_MAX_M) ||
+         (usable(features.leftRear) && features.leftRear.near < TRACK_PRESENT_MAX_M) ||
+         (usable(features.rightRear) && features.rightRear.near < TRACK_PRESENT_MAX_M);
 }
 
 static float sideCenterError(const ScanFeatures &features) {
@@ -646,8 +650,7 @@ static void onHalfLapComplete(const ScanFeatures &features) {
 
   bool skipAlign = frontIsClear(features) &&
                    sideWallsUsable(features) &&
-                   yawDataUsable(features) &&
-                   fabs(yawError(features)) < ALIGN_YAW_OK_M;
+                   (!yawDataUsable(features) || fabs(yawError(features)) < ALIGN_YAW_OK_M);
   enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
 }
 
@@ -723,9 +726,11 @@ static void updateStraight(const ScanFeatures &features) {
 
   if (elapsed > MIN_STRAIGHT_BEFORE_CORNER_MS && frontIsCloseForCorner(features)) {
     cornerConfirm++;
-  } else if (cornerConfirm > 0) {
-    cornerConfirm--;
   }
+  // No decrement: T-junction front-wall readings are intermittent because the
+  // wide sector partially sees the open crossbar. Once any scan confirms the
+  // wall is close we keep the count. MIN_STRAIGHT_BEFORE_CORNER_MS guards
+  // against false triggers right after exiting a turn.
 
   if (cornerConfirm >= CORNER_CONFIRM_SCANS) {
     if (lockedTurnDirection == TURN_RIGHT) {
@@ -759,7 +764,7 @@ static void updateStraight(const ScanFeatures &features) {
     rotate = clampInt(rotate + preTurn, -YAW_LIMIT_ALIGN_PWM, YAW_LIMIT_ALIGN_PWM);
   }
 
-  if (fabs(yawError(features)) > 0.14f) {
+  if (elapsed > 400 && fabs(yawError(features)) > 0.14f) {
     forward = min(forward, STRAIGHT_SLOW_PWM);
   }
 
@@ -837,8 +842,7 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
     } else {
       bool skipAlign = frontIsClear(features) &&
                        sideWallsUsable(features) &&
-                       yawDataUsable(features) &&
-                       fabs(yawError(features)) < ALIGN_YAW_OK_M;
+                       (!yawDataUsable(features) || fabs(yawError(features)) < ALIGN_YAW_OK_M);
       enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
     }
     return;
@@ -893,11 +897,8 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
 
 static void updateAlignAfterTurn(const ScanFeatures &features) {
   unsigned long elapsed = millis() - stateStartMs;
-  bool ready = sideWallsUsable(features) &&
-               frontIsClear(features) &&
-               yawDataUsable(features) &&
-               fabs(sideCenterError(features)) < CENTER_OK_M &&
-               fabs(yawError(features)) < ALIGN_YAW_OK_M;
+  bool ready = frontIsClear(features) &&
+               (!yawDataUsable(features) || fabs(yawError(features)) < ALIGN_YAW_OK_M);
 
   if (elapsed >= ALIGN_MIN_MS && ready) {
     readyConfirm++;
@@ -906,7 +907,7 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
   }
 
   if (readyConfirm >= READY_CONFIRM_SCANS ||
-      (elapsed >= ALIGN_MAX_MS && frontIsClear(features) && sideWallsUsable(features))) {
+      (elapsed >= ALIGN_MAX_MS && frontIsClear(features))) {
     enterState(STATE_STRAIGHT);
     return;
   }
@@ -935,11 +936,12 @@ static void updateTrackState(const ScanFeatures &features) {
     lostTrackConfirm = 0;
   } else {
     lostTrackConfirm++;
-    driveRaw(0, 0, 0, 0);
     if (lostTrackConfirm >= LOST_TRACK_CONFIRM_SCANS) {
       enterState(STATE_STOPPED);
+      return;
     }
-    return;
+    // Don't stop yet — transient loss (e.g. open T-junction) should not halt motion.
+    // Only stop after LOST_TRACK_CONFIRM_SCANS consecutive misses.
   }
 
   printDebug(features);
