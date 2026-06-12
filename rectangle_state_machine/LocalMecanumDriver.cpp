@@ -64,7 +64,7 @@ void LocalMecanumDriver::driveMotor(int motor, int speed) {
 }
 
 void LocalMecanumDriver::driveMotorPins(int pin1, int pin2, int speed) {
-  int duty = constrain(abs(speed), 0, 100);
+  int duty = constrain(abs(speed), 0, 130);
   if (speed >= 0) {
     analogWrite(pin1, duty);
     analogWrite(pin2, 0);

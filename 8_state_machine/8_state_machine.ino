@@ -111,7 +111,7 @@ static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
 static const unsigned long ALIGN_MIN_MS = 80;
 static const unsigned long ALIGN_MAX_MS = 1200;
-static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 700;
+static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 250;
 static const unsigned long CORNER_DECIDE_MAX_MS = 750;
 static const unsigned long TURN_OPEN_LOOP_MIN_MS = 640;
 static const unsigned long TURN_SENSOR_MIN_MS = 760;
@@ -854,6 +854,11 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
   if (elapsed >= TURN_OPEN_LOOP_MIN_MS &&
       yawDataUsable(features) &&
       fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 2.0f) {
+    rotateMagnitude = TURN_ROTATE_BRAKE_PWM;
+  }
+  // Brake by time when yaw data is unavailable (e.g. at a T-junction where
+  // one side is open and diagonal sensors lose the wall).
+  if (!yawDataUsable(features) && elapsed >= TURN_SENSOR_MIN_MS) {
     rotateMagnitude = TURN_ROTATE_BRAKE_PWM;
   }
   if (elapsed > TURN_MAX_MS) {
