@@ -59,7 +59,7 @@ static const int MIN_SECTOR_POINTS = 3;
 static const int ROBUST_SAMPLES = 5;
 
 // -------- Distance thresholds --------
-static const float FRONT_SLOW_M = 0.84f;
+static const float FRONT_SLOW_M = 0.78f;
 static const float FRONT_TURN_TRIGGER_M = 0.44f;
 static const float FRONT_HARD_BRAKE_M = 0.25f;
 static const float FRONT_CLEAR_AFTER_TURN_M = 0.56f;
@@ -77,19 +77,19 @@ static const float YAW_OK_M = 0.075f;
 static const float ALIGN_YAW_OK_M = 0.100f;
 static const float TURN_EXIT_YAW_OK_M = 0.150f;
 
-// -------- Motion tuning, logical PWM range is -100..100 --------
-static const int STRAIGHT_FAST_PWM = 100;
-static const int STRAIGHT_SLOW_PWM = 36;
-static const int ALIGN_FORWARD_PWM = 24;
+// -------- Motion tuning, logical PWM range is -130..130 --------
+static const int STRAIGHT_FAST_PWM = 130;
+static const int STRAIGHT_SLOW_PWM = 48;
+static const int ALIGN_FORWARD_PWM = 36;
 static const int ALIGN_ROTATE_PWM = 36;
 static const int PRE_TURN_ROTATE_PWM = 12;
 static const int CORNER_APPROACH_FORWARD_PWM = 12;
-static const int TURN_ROTATE_FAST_PWM = 54;
-static const int TURN_ROTATE_SLOW_PWM = 42;
-static const int TURN_ROTATE_FINE_PWM = 30;
-static const int TURN_ROTATE_BRAKE_PWM = 22;
-static const int TURN_ARC_FORWARD_PWM = 16;
-static const int TURN_EXIT_FORWARD_PWM = 18;
+static const int TURN_ROTATE_FAST_PWM = 66;
+static const int TURN_ROTATE_SLOW_PWM = 52;
+static const int TURN_ROTATE_FINE_PWM = 36;
+static const int TURN_ROTATE_BRAKE_PWM = 26;
+static const int TURN_ARC_FORWARD_PWM = 24;
+static const int TURN_EXIT_FORWARD_PWM = 26;
 static const int CORNER_BACKOFF_PWM = 18;
 
 static const float STRAFE_KP = 145.0f;
@@ -104,7 +104,7 @@ static const unsigned long DEBUG_PERIOD_MS = 700;
 static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
 static const unsigned long ALIGN_MIN_MS = 80;
-static const unsigned long ALIGN_MAX_MS = 1200;
+static const unsigned long ALIGN_MAX_MS = 500;
 static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 700;
 static const unsigned long CORNER_DECIDE_MAX_MS = 750;
 static const unsigned long TURN_OPEN_LOOP_MIN_MS = 640;
@@ -173,7 +173,6 @@ static int readyConfirm = 0;
 static int decisionConfirm = 0;
 static int lostTrackConfirm = 0;
 
-static bool finishPendingAfterAlign = false;
 
 static bool legCaptured[4] = { false, false, false, false };
 static float legProgress[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -560,10 +559,10 @@ static int insideClearanceStrafe(const ScanFeatures &features, TurnDirection tur
 
 static void driveRaw(int lf, int rf, int lr, int rr) {
   mecanum.driveAllMotor(
-    clampInt(lf, -100, 100),
-    clampInt(rf, -100, 100),
-    clampInt(lr, -100, 100),
-    clampInt(rr, -100, 100)
+    clampInt(lf, -130, 130),
+    clampInt(rf, -130, 130),
+    clampInt(lr, -130, 130),
+    clampInt(rr, -130, 130)
   );
 }
 
@@ -578,11 +577,11 @@ static void driveVector(int forward, int strafeRight, int rotateRight) {
   int rr = forward + strafeRight - rotateRight;
 
   int maxAbs = max(max(abs(lf), abs(rf)), max(abs(lr), abs(rr)));
-  if (maxAbs > 100) {
-    lf = (lf * 100) / maxAbs;
-    rf = (rf * 100) / maxAbs;
-    lr = (lr * 100) / maxAbs;
-    rr = (rr * 100) / maxAbs;
+  if (maxAbs > 130) {
+    lf = (lf * 130) / maxAbs;
+    rf = (rf * 130) / maxAbs;
+    lr = (lr * 130) / maxAbs;
+    rr = (rr * 130) / maxAbs;
   }
 
   driveRaw(lf, rf, lr, rr);
@@ -628,13 +627,10 @@ static void enterState(TrackState nextState) {
     currentLegProgress = 0.0f;
   }
 
-  Serial.printf("STATE -> %s | turn=%s | turns=%d | leg=%.0f | target=%.0f | finish=%s\r\n",
+  Serial.printf("STATE -> %s | turn=%s | turns=%d\r\n",
                 stateName(state),
                 turnName(lockedTurnDirection),
-                completedTurns,
-                currentLegProgress,
-                finishTargetProgress,
-                finishPendingAfterAlign ? "yes" : "no");
+                completedTurns);
 
   if (state == STATE_STOPPED) {
     driveRaw(0, 0, 0, 0);
@@ -796,7 +792,11 @@ static void updateStraight(const ScanFeatures &features) {
     rotate = clampInt(rotate + preTurn, -YAW_LIMIT_ALIGN_PWM, YAW_LIMIT_ALIGN_PWM);
   }
 
-  if (fabs(yawError(features)) > 0.14f) {
+  // Skip yaw speed-cap for the first 400 ms after entering STATE_STRAIGHT.
+  // Diagonal sensors need time to stabilise after a turn; without this guard
+  // a residual yawError > 0.14 briefly clamps forward to STRAIGHT_SLOW_PWM
+  // even when the car is already well aligned.
+  if (elapsed > 400 && fabs(yawError(features)) > 0.14f) {
     forward = min(forward, STRAIGHT_SLOW_PWM);
   }
 
@@ -868,18 +868,11 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
 
   if (readyConfirm >= READY_CONFIRM_SCANS) {
     completedTurns++;
-    if (completedTurns >= 4) {
-      finishPendingAfterAlign = true;
-    }
     bool skipAlign = frontIsClear(features) &&
                      sideWallsUsable(features) &&
                      yawDataUsable(features) &&
                      fabs(yawError(features)) < ALIGN_YAW_OK_M;
-    if (skipAlign) {
-      enterState(finishPendingAfterAlign ? STATE_FINISH_STRAIGHT : STATE_STRAIGHT);
-    } else {
-      enterState(STATE_ALIGN_AFTER_TURN);
-    }
+    enterState(skipAlign ? STATE_STRAIGHT : STATE_ALIGN_AFTER_TURN);
     return;
   }
 
@@ -930,7 +923,6 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
   bool ready = sideWallsUsable(features) &&
                frontIsClear(features) &&
                yawDataUsable(features) &&
-               fabs(sideCenterError(features)) < CENTER_OK_M &&
                fabs(yawError(features)) < ALIGN_YAW_OK_M;
 
   if (elapsed >= ALIGN_MIN_MS && ready) {
@@ -941,11 +933,7 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
 
   if (readyConfirm >= READY_CONFIRM_SCANS ||
       (elapsed >= ALIGN_MAX_MS && frontIsClear(features) && sideWallsUsable(features))) {
-    if (finishPendingAfterAlign) {
-      enterState(STATE_FINISH_STRAIGHT);
-    } else {
-      enterState(STATE_STRAIGHT);
-    }
+    enterState(STATE_STRAIGHT);
     return;
   }
 
