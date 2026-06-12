@@ -10,15 +10,18 @@
   forms a figure-8. The car starts on the crossbar, travelling toward the
   first T-junction.
 
-  Route (one full lap = 8 turns):
+  Route (one full lap = 8 turns, then stop):
     Half A (4 right turns): crossbar → T-junction right → corner right →
                              corner right → T-junction right → back on crossbar
     Half B (4 left turns):  crossbar → T-junction left → corner left →
                              corner left → T-junction left → back on crossbar
-  Then flip direction and repeat indefinitely.
+  Then stop. To run the opposite global direction, manually turn the car around
+  and power-cycle it; the same right-then-left relative route is used.
 
-  T-junctions look identical to normal corners from the LiDAR's perspective
-  (front wall present, one side open), so the same corner-detection logic works.
+  T-junctions are detected with two cues: a close front wall when LiDAR sees it,
+  and the planned turn-side front sector opening while the rear side sector is
+  still walled. The second cue covers T-junctions where the front wall is sparse
+  or partly hidden by the geometry.
 
   Lidar angle convention:
     lidar 180 deg -> car front/head, about 8 cm behind the front bumper
@@ -66,8 +69,8 @@ static const int MIN_SECTOR_POINTS = 3;
 static const int ROBUST_SAMPLES = 5;
 
 // -------- Distance thresholds --------
-static const float FRONT_SLOW_M = 0.84f;
-static const float FRONT_TURN_TRIGGER_M = 0.44f;
+static const float FRONT_SLOW_M = 0.86f;
+static const float FRONT_TURN_TRIGGER_M = 0.48f;
 static const float FRONT_HARD_BRAKE_M = 0.25f;
 static const float FRONT_CLEAR_AFTER_TURN_M = 0.56f;
 
@@ -80,23 +83,23 @@ static const float TRACK_PRESENT_MAX_M = 0.95f;
 
 static const float CENTER_OK_M = 0.060f;
 static const float YAW_OK_M = 0.075f;
-static const float ALIGN_YAW_OK_M = 0.100f;
-static const float TURN_EXIT_YAW_OK_M = 0.150f;
+static const float ALIGN_YAW_OK_M = 0.120f;
+static const float TURN_EXIT_YAW_OK_M = 0.140f;
 
 // -------- Motion tuning, logical PWM range is -100..100 --------
 static const int STRAIGHT_FAST_PWM = 100;
-static const int STRAIGHT_SLOW_PWM = 36;
-static const int ALIGN_FORWARD_PWM = 24;
+static const int STRAIGHT_SLOW_PWM = 48;
+static const int ALIGN_FORWARD_PWM = 30;
 static const int ALIGN_ROTATE_PWM = 36;
-static const int PRE_TURN_ROTATE_PWM = 12;
-static const int CORNER_APPROACH_FORWARD_PWM = 12;
-static const int TURN_ROTATE_FAST_PWM = 54;
-static const int TURN_ROTATE_SLOW_PWM = 42;
-static const int TURN_ROTATE_FINE_PWM = 30;
-static const int TURN_ROTATE_BRAKE_PWM = 22;
-static const int TURN_ARC_FORWARD_PWM = 16;
-static const int TURN_EXIT_FORWARD_PWM = 18;
-static const int CORNER_BACKOFF_PWM = 18;
+static const int PRE_TURN_ROTATE_PWM = 15;
+static const int CORNER_APPROACH_FORWARD_PWM = 22;
+static const int TURN_ROTATE_FAST_PWM = 64;
+static const int TURN_ROTATE_SLOW_PWM = 50;
+static const int TURN_ROTATE_FINE_PWM = 36;
+static const int TURN_ROTATE_BRAKE_PWM = 24;
+static const int TURN_ARC_FORWARD_PWM = 24;
+static const int TURN_EXIT_FORWARD_PWM = 30;
+static const int CORNER_BACKOFF_PWM = 22;
 
 static const float STRAFE_KP = 145.0f;
 static const float YAW_KP = 110.0f;
@@ -104,30 +107,38 @@ static const int STRAFE_LIMIT_PWM = 28;
 static const int TURN_STRAFE_LIMIT_PWM = 18;
 static const int YAW_LIMIT_STRAIGHT_PWM = 17;
 static const int YAW_LIMIT_ALIGN_PWM = 26;
+static const int STRAIGHT_YAW_SLOW_PWM = 72;
+static const float STRAIGHT_YAW_SLOW_M = 0.200f;
+static const float TURN_ARC_FRONT_MIN_M = 0.38f;
+static const float TURN_BRAKE_YAW_WINDOW_MULT = 2.50f;
+static const float TURN_FALLBACK_YAW_WINDOW_MULT = 1.70f;
 
 // -------- Time/debounce tuning --------
 static const unsigned long DEBUG_PERIOD_MS = 700;
 static const unsigned long ACQUIRE_MIN_MS = 450;
 static const unsigned long ACQUIRE_MAX_MS = 2200;
-static const unsigned long ALIGN_MIN_MS = 80;
-static const unsigned long ALIGN_MAX_MS = 1200;
+static const unsigned long ALIGN_MIN_MS = 40;
+static const unsigned long ALIGN_MAX_MS = 850;
 static const unsigned long MIN_STRAIGHT_BEFORE_CORNER_MS = 700;
-static const unsigned long CORNER_DECIDE_MAX_MS = 750;
-static const unsigned long TURN_OPEN_LOOP_MIN_MS = 640;
-static const unsigned long TURN_SENSOR_MIN_MS = 760;
-static const unsigned long TURN_FAST_MS = 460;
-static const unsigned long TURN_SOFT_MAX_MS = 1180;
-static const unsigned long TURN_MAX_MS = 1850;
+static const unsigned long CORNER_DECIDE_MAX_MS = 480;
+static const unsigned long TURN_OPEN_LOOP_MIN_MS = 520;
+static const unsigned long TURN_SENSOR_MIN_MS = 650;
+static const unsigned long TURN_FAST_MS = 430;
+static const unsigned long TURN_SOFT_MAX_MS = 1080;
+static const unsigned long TURN_MAX_MS = 1700;
 static const unsigned long TURN_FAILSAFE_BACKOFF_MS = 180;
 static const unsigned long LIDAR_RECOVER_PERIOD_MS = 1500;
 
 static const int CORNER_CONFIRM_SCANS = 2;
 static const int TURN_DECISION_CONFIRM_SCANS = 2;
 static const int READY_CONFIRM_SCANS = 2;
+static const int TURN_READY_CONFIRM_SCANS = 1;
 static const int LOST_TRACK_CONFIRM_SCANS = 8;
 
 // Number of same-direction turns per half-lap before flipping direction.
 static const int TURNS_PER_HALF_LAP = 4;
+// One requested run is exactly one figure-8 lap: right half + left half, then stop.
+static const int HALF_LAPS_PER_RUN = 2;
 
 enum TrackState {
   STATE_ACQUIRE_STRAIGHT = 1,
@@ -213,6 +224,7 @@ static RangeStat sectorStat(int centerDeg, int halfWidthDeg);
 static ScanFeatures buildFeatures();
 static bool statCloserThan(const RangeStat &stat, float distance);
 static bool statFartherThan(const RangeStat &stat, float distance);
+static bool rangeLooksOpen(const RangeStat &stat, float distance);
 static bool frontIsClear(const ScanFeatures &features);
 static bool frontIsCloseForCorner(const ScanFeatures &features);
 static bool frontIsDangerouslyClose(const ScanFeatures &features);
@@ -229,6 +241,8 @@ static float leftCornerOpenScore(const ScanFeatures &features);
 static float rightCornerOpenScore(const ScanFeatures &features);
 static TurnDirection detectedCornerDirection(const ScanFeatures &features);
 static TurnDirection fallbackCornerDirection(const ScanFeatures &features);
+static bool plannedTurnSideOpen(const ScanFeatures &features);
+static bool cornerTriggerReady(const ScanFeatures &features);
 static bool turnExitReady(const ScanFeatures &features, unsigned long elapsed);
 static int insideClearanceStrafe(const ScanFeatures &features, TurnDirection turnDirection);
 static void driveRaw(int lf, int rf, int lr, int rr);
@@ -358,6 +372,10 @@ static bool statCloserThan(const RangeStat &stat, float distance) {
 
 static bool statFartherThan(const RangeStat &stat, float distance) {
   return !usable(stat) || stat.near > distance;
+}
+
+static bool rangeLooksOpen(const RangeStat &stat, float distance) {
+  return usable(stat) && stat.near > distance;
 }
 
 static bool frontIsClear(const ScanFeatures &features) {
@@ -527,9 +545,40 @@ static TurnDirection fallbackCornerDirection(const ScanFeatures &features) {
   return TURN_UNKNOWN;
 }
 
-static bool turnExitReady(const ScanFeatures &features, unsigned long elapsed) {
-  if (elapsed < TURN_SENSOR_MIN_MS || !frontIsClear(features) || !sideWallsUsable(features)) {
+static bool plannedTurnSideOpen(const ScanFeatures &features) {
+  if (lockedTurnDirection == TURN_UNKNOWN) {
     return false;
+  }
+
+  const bool turnRight = lockedTurnDirection == TURN_RIGHT;
+  const RangeStat &frontSide = turnRight ? features.rightFront : features.leftFront;
+  const RangeStat &wideSide = turnRight ? features.rightWide : features.leftWide;
+  const RangeStat &rearSide = turnRight ? features.rightRear : features.leftRear;
+  const RangeStat &oppositeWide = turnRight ? features.leftWide : features.rightWide;
+  float plannedScore = turnRight ? rightCornerOpenScore(features) : leftCornerOpenScore(features);
+
+  bool sideFrontOpen = rangeLooksOpen(frontSide, DIAGONAL_OPEN_M) ||
+                       rangeLooksOpen(wideSide, SIDE_OPEN_M);
+  bool stillInCorridor = statCloserThan(rearSide, TRACK_PRESENT_MAX_M) ||
+                         statCloserThan(oppositeWide, TRACK_PRESENT_MAX_M) ||
+                         statCloserThan(features.frontWide, FRONT_SLOW_M);
+
+  return sideFrontOpen &&
+         plannedScore > 0.95f &&
+         (stillInCorridor || plannedScore > 1.35f);
+}
+
+static bool cornerTriggerReady(const ScanFeatures &features) {
+  return frontIsCloseForCorner(features) || plannedTurnSideOpen(features);
+}
+
+static bool turnExitReady(const ScanFeatures &features, unsigned long elapsed) {
+  if (elapsed < TURN_SENSOR_MIN_MS || !frontIsClear(features)) {
+    return false;
+  }
+
+  if (!sideWallsUsable(features)) {
+    return elapsed >= TURN_SOFT_MAX_MS && trackLooksPresent(features);
   }
 
   if (!yawDataUsable(features)) {
@@ -540,7 +589,8 @@ static bool turnExitReady(const ScanFeatures &features, unsigned long elapsed) {
     return true;
   }
 
-  return elapsed >= TURN_SOFT_MAX_MS && fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 1.6f;
+  return elapsed >= TURN_SOFT_MAX_MS &&
+         fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * TURN_FALLBACK_YAW_WINDOW_MULT;
 }
 
 static int insideClearanceStrafe(const ScanFeatures &features, TurnDirection turnDirection) {
@@ -637,7 +687,13 @@ static void onHalfLapComplete(const ScanFeatures &features) {
   halfLaps++;
   completedTurns = 0;
 
-  // Flip the locked direction for the next half-lap.
+  if (halfLaps >= HALF_LAPS_PER_RUN) {
+    Serial.printf("FULL_LAP_DONE total_halves=%d stopping\r\n", halfLaps);
+    enterState(STATE_STOPPED);
+    return;
+  }
+
+  // Flip the locked direction for the second half-lap.
   lockedTurnDirection = (lockedTurnDirection == TURN_RIGHT) ? TURN_LEFT : TURN_RIGHT;
 
   Serial.printf("HALF_LAP_DONE total_halves=%d next_turn=%s\r\n",
@@ -661,7 +717,7 @@ static void printDebug(const ScanFeatures &features) {
   unsigned long elapsed = now - stateStartMs;
 
   Serial.printf(
-    "#%lu %s ms=%lu turn=%s half=%d n=%d ready=%d F=%.2f FW=%.2f L=%.2f R=%.2f LF=%.2f RF=%.2f CE=%.2f YE=%.2f cmd=%d,%d,%d\r\n",
+    "#%lu %s ms=%lu turn=%s half=%d n=%d ready=%d T=%d TO=%d F=%.2f FW=%.2f L=%.2f R=%.2f LF=%.2f RF=%.2f CE=%.2f YE=%.2f cmd=%d,%d,%d\r\n",
     scanIndex,
     stateName(state),
     elapsed,
@@ -669,6 +725,8 @@ static void printDebug(const ScanFeatures &features) {
     halfLaps,
     completedTurns,
     readyConfirm,
+    frontIsCloseForCorner(features) ? 1 : 0,
+    plannedTurnSideOpen(features) ? 1 : 0,
     features.front.near,
     features.frontWide.near,
     features.left.near,
@@ -707,10 +765,12 @@ static void updateAcquireStraight(const ScanFeatures &features) {
   int rotate = yawCorrectionPwm(features, YAW_LIMIT_ALIGN_PWM);
   int forward = frontIsClear(features) ? ALIGN_FORWARD_PWM : -8;
 
-  if (frontIsCloseForCorner(features)) {
+  if (cornerTriggerReady(features)) {
     TurnDirection direction = detectedCornerDirection(features);
     if (direction != TURN_UNKNOWN) {
       rotate = (direction == TURN_RIGHT) ? ALIGN_ROTATE_PWM : -ALIGN_ROTATE_PWM;
+    } else if (lockedTurnDirection != TURN_UNKNOWN) {
+      rotate = (lockedTurnDirection == TURN_RIGHT) ? ALIGN_ROTATE_PWM : -ALIGN_ROTATE_PWM;
     }
     forward = frontIsDangerouslyClose(features) ? -CORNER_BACKOFF_PWM : 0;
   }
@@ -721,7 +781,9 @@ static void updateAcquireStraight(const ScanFeatures &features) {
 static void updateStraight(const ScanFeatures &features) {
   unsigned long elapsed = millis() - stateStartMs;
 
-  if (elapsed > MIN_STRAIGHT_BEFORE_CORNER_MS && frontIsCloseForCorner(features)) {
+  bool cornerReady = cornerTriggerReady(features);
+
+  if (elapsed > MIN_STRAIGHT_BEFORE_CORNER_MS && cornerReady) {
     cornerConfirm++;
   } else if (cornerConfirm > 0) {
     cornerConfirm--;
@@ -754,12 +816,17 @@ static void updateStraight(const ScanFeatures &features) {
   int strafe = sideCorrectionPwm(features);
   int rotate = yawCorrectionPwm(features, YAW_LIMIT_STRAIGHT_PWM);
 
-  if (lockedTurnDirection != TURN_UNKNOWN && statCloserThan(features.frontWide, FRONT_SLOW_M)) {
+  if (lockedTurnDirection != TURN_UNKNOWN &&
+      (statCloserThan(features.frontWide, FRONT_SLOW_M) || plannedTurnSideOpen(features))) {
     int preTurn = (lockedTurnDirection == TURN_RIGHT) ? PRE_TURN_ROTATE_PWM : -PRE_TURN_ROTATE_PWM;
     rotate = clampInt(rotate + preTurn, -YAW_LIMIT_ALIGN_PWM, YAW_LIMIT_ALIGN_PWM);
   }
 
-  if (fabs(yawError(features)) > 0.14f) {
+  if (fabs(yawError(features)) > STRAIGHT_YAW_SLOW_M) {
+    forward = min(forward, STRAIGHT_YAW_SLOW_PWM);
+  }
+
+  if (cornerReady && lockedTurnDirection != TURN_UNKNOWN) {
     forward = min(forward, STRAIGHT_SLOW_PWM);
   }
 
@@ -828,7 +895,7 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
     readyConfirm--;
   }
 
-  if (readyConfirm >= READY_CONFIRM_SCANS) {
+  if (readyConfirm >= TURN_READY_CONFIRM_SCANS) {
     completedTurns++;
 
     if (completedTurns >= TURNS_PER_HALF_LAP) {
@@ -853,7 +920,7 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
   }
   if (elapsed >= TURN_OPEN_LOOP_MIN_MS &&
       yawDataUsable(features) &&
-      fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * 2.0f) {
+      fabs(yawError(features)) < TURN_EXIT_YAW_OK_M * TURN_BRAKE_YAW_WINDOW_MULT) {
     rotateMagnitude = TURN_ROTATE_BRAKE_PWM;
   }
   if (elapsed > TURN_MAX_MS) {
@@ -879,7 +946,7 @@ static void updateQuarterTurn(const ScanFeatures &features, TurnDirection turnDi
   } else if (frontIsClear(features) && elapsed > TURN_SENSOR_MIN_MS) {
     forward = TURN_EXIT_FORWARD_PWM;
   } else if (!usable(features.front) ||
-             features.front.near > FRONT_HARD_BRAKE_M + 0.08f) {
+             features.front.near > TURN_ARC_FRONT_MIN_M) {
     forward = TURN_ARC_FORWARD_PWM;
   }
 
@@ -901,7 +968,7 @@ static void updateAlignAfterTurn(const ScanFeatures &features) {
   }
 
   if (readyConfirm >= READY_CONFIRM_SCANS ||
-      (elapsed >= ALIGN_MAX_MS && frontIsClear(features) && sideWallsUsable(features))) {
+      (elapsed >= ALIGN_MAX_MS && frontIsClear(features) && trackLooksPresent(features))) {
     enterState(STATE_STRAIGHT);
     return;
   }
