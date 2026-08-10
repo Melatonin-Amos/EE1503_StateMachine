@@ -185,7 +185,10 @@ The report records five rectangular-track trials in each direction:
 | Clockwise (`N = 5`) | `21.72 ± 0.48 s` |
 | Counter-clockwise (`N = 5`) | `21.88 ± 0.56 s` |
 
-These numbers describe one tuned prototype on one course; they are a result, not a default performance promise. The figure-eight controller also passed the course acceptance test, including both observed T-junction geometries.
+These numbers describe one tuned prototype on one course; they are a result, not a default performance promise. **In fact, after further tuning, we achieved a lap time of approximately 19.1 s before the acceptance test.** We believe that, under the output power constraint, the theoretical best time on the rectangular track could be around 18 s.
+
+
+The figure-eight controller also passed the course acceptance test, including both observed T-junction geometries.
 
 <p align="center">
   <img src="assets/report/figure-eight-track.jpg" alt="The robot turning at two T-junction geometries and a normal corner on the blue foam figure-eight track" width="92%">
